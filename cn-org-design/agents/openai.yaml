@@ -1,0 +1,4 @@
+interface:
+  display_name: "建设工程系列：施工组织设计"
+  short_description: "依据正式项目资料编制、审查并交付完整房建施工组织设计"
+  default_prompt: "使用 $cn-org-design 根据正式施工图、项目资料和企业模板编制并验收施工组织设计。"
