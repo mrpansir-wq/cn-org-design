@@ -64,10 +64,19 @@ def audit(path: Path) -> dict:
     settings = load_xml(zf, "word/settings.xml")
 
     style_names = {}
+    style_pprops = {}
     for style in styles_root.findall(W + "style"):
         style_id = style.get(W + "styleId", "")
         name_el = style.find(W + "name")
         style_names[style_id] = name_el.get(W + "val", "") if name_el is not None else ""
+        ppr = style.find(W + "pPr")
+        jc = None
+        if ppr is not None:
+            jc_el = ppr.find(W + "jc")
+            jc = jc_el.get(W + "val") if jc_el is not None else None
+        rpr = style.find(W + "rPr")
+        has_b = rpr is not None and rpr.find(W + "b") is not None
+        style_pprops[style_id] = {"jc": jc, "b": has_b}
 
     tables = document.findall(".//" + W + "tbl")
     paragraphs = document.findall(".//" + W + "p")
@@ -135,6 +144,105 @@ def audit(path: Path) -> dict:
     if body_style_in_table:
         sample = [f"表{t} {s} {txt}" for t, txt, s in body_style_in_table[:10]]
         result["errors"].append("表格内仍使用正文/空样式: " + " | ".join(sample))
+
+    # ---- style reference integrity across all parts ----
+    dangling = []
+    for part_name in names:
+        if not re.fullmatch(r"word/(document|header\d+|footer\d+|footnotes|endnotes)\.xml", part_name):
+            continue
+        part = load_xml(zf, part_name)
+        for tag in ("pStyle", "rStyle", "tblStyle"):
+            for el in part.iter(W + tag):
+                v = el.get(W + "val", "")
+                if v and v not in style_names:
+                    dangling.append((part_name, tag, v))
+    if dangling:
+        sample = " | ".join(f"{p}:{t}={v}" for p, t, v in sorted(set(dangling))[:10])
+        result["errors"].append("存在未定义的样式引用: " + sample)
+
+    # ---- per-table style uniformity and direct-format residue ----
+    mixed_body = []
+    firstrow_mixed = []
+    firstrow_not_header = []
+    header_not_center_bold = []
+    body_not_left = []
+    direct_in_cells = []
+
+    for ti, table in enumerate(tables, 1):
+        rows = table.findall(W + "tr")
+        if not rows:
+            continue
+
+        def cell_styles(row_iter):
+            out = []
+            for row in row_iter:
+                for tc in row.findall(W + "tc"):
+                    for p in tc.findall(".//" + W + "p"):
+                        ppr = p.find(W + "pPr")
+                        ps = ppr.find(W + "pStyle") if ppr is not None else None
+                        out.append(ps.get(W + "val", "") if ps is not None else "")
+            return out
+
+        firstrow_sids = cell_styles(rows[:1])
+        fr_set = set(firstrow_sids) - {""}
+        if len(fr_set) > 1:
+            firstrow_mixed.append(f"{ti}:" + ",".join(sorted(style_names.get(s, s) for s in fr_set)))
+        elif fr_set:
+            sid = next(iter(fr_set))
+            name = style_names.get(sid, sid)
+            if "表头" not in name:
+                firstrow_not_header.append(f"{ti}:{name}")
+            props = style_pprops.get(sid, {})
+            if props.get("jc") != "center" or not props.get("b"):
+                header_not_center_bold.append(f"{ti}:{name}")
+
+        body_sids = cell_styles(rows[1:])
+        body_set = set(body_sids) - {""}
+        if len(body_set) > 1:
+            mixed_body.append(f"{ti}:" + ",".join(sorted(style_names.get(s, s) for s in body_set)))
+        elif body_set:
+            sid = next(iter(body_set))
+            if style_pprops.get(sid, {}).get("jc") != "left":
+                body_not_left.append(f"{ti}:{style_names.get(sid, sid)}")
+
+        for row in rows:
+            for tc in row.findall(W + "tc"):
+                for p in tc.findall(".//" + W + "p"):
+                    ppr = p.find(W + "pPr")
+                    if ppr is not None:
+                        if ppr.find(W + "jc") is not None:
+                            direct_in_cells.append(f"{ti}:段落直接对齐")
+                        ind = ppr.find(W + "ind")
+                        if ind is not None and any(
+                            a in (W + "firstLine", W + "firstLineChars") for a in ind.attrib
+                        ):
+                            direct_in_cells.append(f"{ti}:单元格首行缩进")
+                    for r in p.findall(W + "r"):
+                        rpr = r.find(W + "rPr")
+                        if rpr is not None and rpr.find(W + "b") is not None:
+                            direct_in_cells.append(f"{ti}:run直接加粗")
+
+    if firstrow_mixed:
+        result["errors"].append("表格首行混用多种样式: " + " | ".join(firstrow_mixed[:10]))
+    if firstrow_not_header:
+        result["errors"].append("表格首行未使用表头样式: " + " | ".join(firstrow_not_header[:10]))
+    if header_not_center_bold:
+        result["warnings"].append("表头样式未提供居中加粗: " + " | ".join(header_not_center_bold[:10]))
+    if mixed_body:
+        result["errors"].append("表内正文样式混用（居中/左对齐并存）: " + " | ".join(mixed_body[:10]))
+    if body_not_left:
+        result["errors"].append("表格正文样式未左对齐: " + " | ".join(body_not_left[:10]))
+    if direct_in_cells:
+        sample = " | ".join(sorted(set(direct_in_cells))[:10])
+        result["warnings"].append("表格单元格存在直接格式残留: " + sample)
+
+    result["metrics"]["table_style_uniform_issues"] = {
+        "firstrow_mixed": len(firstrow_mixed),
+        "firstrow_not_header": len(firstrow_not_header),
+        "mixed_body": len(mixed_body),
+        "body_not_left": len(body_not_left),
+        "direct_in_cells": len(set(direct_in_cells)),
+    }
 
     update_fields = settings.find(W + "updateFields")
     if update_fields is None or update_fields.get(W + "val") not in {"1", "true", "on"}:
